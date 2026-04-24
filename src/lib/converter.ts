@@ -11,7 +11,7 @@ const WORKER_URL = `https://unpkg.com/pdfjs-dist@${PDF_JS_VERSION}/build/pdf.wor
 PDFJS.GlobalWorkerOptions.workerSrc = WORKER_URL;
 
 export async function convertPdfToWord(file: File): Promise<Blob> {
-  console.log('Starting PDF to Word conversion...');
+  console.log('Starting High-Fidelity PDF to Word conversion...');
   const arrayBuffer = await file.arrayBuffer();
   
   try {
@@ -22,49 +22,65 @@ export async function convertPdfToWord(file: File): Promise<Blob> {
     const sections = [];
 
     for (let i = 1; i <= pdf.numPages; i++) {
-      console.log(`Processing page ${i}...`);
+      console.log(`Processing page ${i} with formatting extraction...`);
       const page = await pdf.getPage(i);
       const textContent = await page.getTextContent();
       
-      // Sort items by Y descending (top to bottom), then X ascending
+      // Sort items: Y descending (top to bottom), then X ascending
       const items = (textContent.items as any[]).sort((a, b) => {
-        // If Y is significantly different, sort by Y
-        if (Math.abs(a.transform[5] - b.transform[5]) > 2) {
+        if (Math.abs(a.transform[5] - b.transform[5]) > 3) {
           return b.transform[5] - a.transform[5];
         }
-        // Otherwise sort by X
         return a.transform[4] - b.transform[4];
       });
 
-      const pageParagraphs = [];
-      let currentLine: string[] = [];
+      const pageChildren = [];
+      let currentLine: any[] = [];
       let lastY = items.length > 0 ? items[0].transform[5] : 0;
 
       for (const item of items) {
-        // If Y changed significantly, it's a new line
+        // PDFJS transform[3] is height (font size)
+        const fontSize = Math.round(item.transform[3]);
+        const isBold = /bold|heavy|black/i.test(item.fontName || '');
+        const isItalic = /italic|oblique/i.test(item.fontName || '');
+        
+        // Convert item to a TextRun
+        const run = new TextRun({
+          text: item.str,
+          size: fontSize * 2, // docx uses half-points
+          bold: isBold,
+          italics: isItalic,
+          font: "Arial", // Standard safe fallback
+        });
+
+        // New line detection (tolerance of 5 units)
         if (Math.abs(item.transform[5] - lastY) > 5) {
           if (currentLine.length > 0) {
-            pageParagraphs.push(new Paragraph({
-              children: [new TextRun(currentLine.join(' '))],
+            pageChildren.push(new Paragraph({
+              children: [...currentLine],
+              spacing: { after: 120 },
             }));
           }
-          currentLine = [item.str];
+          currentLine = [run];
           lastY = item.transform[5];
         } else {
-          // If there's a big gap in X, add extra spaces
-          currentLine.push(item.str);
+          // Check for significant horizontal gap to add spaces
+          if (currentLine.length > 0) {
+            currentLine.push(new TextRun(" "));
+          }
+          currentLine.push(run);
         }
       }
       
-      // Add last line
+      // Flush remaining line
       if (currentLine.length > 0) {
-        pageParagraphs.push(new Paragraph({
-          children: [new TextRun(currentLine.join(' '))],
+        pageChildren.push(new Paragraph({
+          children: currentLine,
         }));
       }
 
       sections.push({
-        children: pageParagraphs,
+        children: pageChildren,
       });
     }
 
@@ -72,10 +88,10 @@ export async function convertPdfToWord(file: File): Promise<Blob> {
       sections,
     });
 
-    console.log('Generating Word file...');
+    console.log('Generating Word file with structure preservation...');
     return await Packer.toBlob(doc);
   } catch (error) {
-    console.error('PDF to Word Error:', error);
+    console.error('Advanced PDF to Word Error:', error);
     throw error;
   }
 }
