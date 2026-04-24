@@ -1,0 +1,6 @@
+{
+  "name": "ConvertFlow",
+  "description": "A secure, fast, and mobile-friendly document converter for PDF to Word and Word to PDF. Privacy-focused with client-side processing.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
