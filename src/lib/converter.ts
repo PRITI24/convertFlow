@@ -26,18 +26,45 @@ export async function convertPdfToWord(file: File): Promise<Blob> {
       const page = await pdf.getPage(i);
       const textContent = await page.getTextContent();
       
-      // Extract string content
-      const textItems = textContent.items
-        .map((item: any) => item.str)
-        .filter(str => str.trim().length > 0)
-        .join(' ');
+      // Sort items by Y descending (top to bottom), then X ascending
+      const items = (textContent.items as any[]).sort((a, b) => {
+        // If Y is significantly different, sort by Y
+        if (Math.abs(a.transform[5] - b.transform[5]) > 2) {
+          return b.transform[5] - a.transform[5];
+        }
+        // Otherwise sort by X
+        return a.transform[4] - b.transform[4];
+      });
+
+      const pageParagraphs = [];
+      let currentLine: string[] = [];
+      let lastY = items.length > 0 ? items[0].transform[5] : 0;
+
+      for (const item of items) {
+        // If Y changed significantly, it's a new line
+        if (Math.abs(item.transform[5] - lastY) > 5) {
+          if (currentLine.length > 0) {
+            pageParagraphs.push(new Paragraph({
+              children: [new TextRun(currentLine.join(' '))],
+            }));
+          }
+          currentLine = [item.str];
+          lastY = item.transform[5];
+        } else {
+          // If there's a big gap in X, add extra spaces
+          currentLine.push(item.str);
+        }
+      }
       
+      // Add last line
+      if (currentLine.length > 0) {
+        pageParagraphs.push(new Paragraph({
+          children: [new TextRun(currentLine.join(' '))],
+        }));
+      }
+
       sections.push({
-        children: [
-          new Paragraph({
-            children: [new TextRun(textItems)],
-          }),
-        ],
+        children: pageParagraphs,
       });
     }
 
@@ -78,17 +105,45 @@ export async function convertWordToPdf(file: File): Promise<Blob> {
       logging: false,
     });
     
-    const imgData = canvas.toDataURL('image/png');
+    const imgWidth = canvas.width / 2;
+    const imgHeight = canvas.height / 2;
+    
+    // Standard A4 aspect ratio is approx 1.414. For width 800px, height is approx 1131px.
+    const pageWidth = imgWidth;
+    const pageHeight = (pageWidth * 297) / 210; // A4 ratio
+    const totalPages = Math.ceil(imgHeight / pageHeight);
+
     const pdf = new jsPDF({
       orientation: 'portrait',
       unit: 'px',
-      format: [canvas.width / 2, canvas.height / 2],
+      format: [pageWidth, pageHeight],
     });
 
-    pdf.addImage(imgData, 'PNG', 0, 0, canvas.width / 2, canvas.height / 2);
+    const imgData = canvas.toDataURL('image/png');
+
+    for (let i = 0; i < totalPages; i++) {
+      if (i > 0) pdf.addPage([pageWidth, pageHeight], 'portrait');
+      
+      // Calculate source y (where to clip from the original canvas)
+      // Since we used scale 2, we need to multiply by 2 for the source coordinate
+      const sourceY = i * pageHeight * 2;
+      const sourceHeight = Math.min(pageHeight * 2, (canvas.height - sourceY));
+      
+      // We can use the full image and just shift the Y offset in addImage
+      // but jspdf's addImage with cropping is sometimes finicky.
+      // A more robust way is to draw a slice to a new canvas or just use the whole image with negative Y
+      pdf.addImage(
+        imgData, 
+        'PNG', 
+        0, 
+        - (i * pageHeight), 
+        imgWidth, 
+        imgHeight
+      );
+    }
     
     document.body.removeChild(container);
-    console.log('Generating PDF file...');
+    console.log(`Generated PDF with ${totalPages} pages.`);
     return pdf.output('blob');
   } catch (error) {
     console.error('Word to PDF Error:', error);
