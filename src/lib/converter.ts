@@ -1,165 +1,233 @@
 import * as PDFJS from 'pdfjs-dist';
-import { Document, Packer, Paragraph, TextRun } from 'docx';
+import { 
+  Document, 
+  Packer, 
+  Paragraph, 
+  TextRun, 
+  AlignmentType, 
+  HeadingLevel,
+  Table,
+  TableRow,
+  TableCell,
+  WidthType,
+  BorderStyle
+} from 'docx';
 import mammoth from 'mammoth';
 import { jsPDF } from 'jspdf';
 import html2canvas from 'html2canvas';
 
 // Configure PDF.js worker
-// Using version 5.6.205 as specified in package.json
 const PDF_JS_VERSION = '5.6.205';
 const WORKER_URL = `https://unpkg.com/pdfjs-dist@${PDF_JS_VERSION}/build/pdf.worker.min.mjs`;
 PDFJS.GlobalWorkerOptions.workerSrc = WORKER_URL;
 
 export async function convertPdfToWord(file: File): Promise<Blob> {
-  console.log('Starting High-Fidelity PDF to Word conversion...');
+  console.log('Starting Professional Layout Analysis...');
   const arrayBuffer = await file.arrayBuffer();
   
   try {
     const loadingTask = PDFJS.getDocument({ data: arrayBuffer });
     const pdf = await loadingTask.promise;
-    console.log(`PDF loaded. Pages: ${pdf.numPages}`);
-    
     const sections = [];
 
     for (let i = 1; i <= pdf.numPages; i++) {
-      console.log(`Processing page ${i} with formatting extraction...`);
+      console.log(`Processing page ${i} with structure analysis...`);
       const page = await pdf.getPage(i);
       const textContent = await page.getTextContent();
+      const viewport = page.getViewport({ scale: 1.0 });
       
-      // Sort items: Y descending (top to bottom), then X ascending
+      // 1. Group items into lines
       const items = (textContent.items as any[]).sort((a, b) => {
-        if (Math.abs(a.transform[5] - b.transform[5]) > 3) {
-          return b.transform[5] - a.transform[5];
-        }
+        if (Math.abs(a.transform[5] - b.transform[5]) > 3) return b.transform[5] - a.transform[5];
         return a.transform[4] - b.transform[4];
       });
 
-      const pageChildren = [];
+      const lines: any[][] = [];
       let currentLine: any[] = [];
       let lastY = items.length > 0 ? items[0].transform[5] : 0;
 
       for (const item of items) {
-        // PDFJS transform[3] is height (font size)
-        const fontSize = Math.round(item.transform[3]);
-        const isBold = /bold|heavy|black/i.test(item.fontName || '');
-        const isItalic = /italic|oblique/i.test(item.fontName || '');
-        
-        // Convert item to a TextRun
-        const run = new TextRun({
-          text: item.str,
-          size: fontSize * 2, // docx uses half-points
-          bold: isBold,
-          italics: isItalic,
-          font: "Arial", // Standard safe fallback
-        });
-
-        // New line detection (tolerance of 5 units)
         if (Math.abs(item.transform[5] - lastY) > 5) {
-          if (currentLine.length > 0) {
-            pageChildren.push(new Paragraph({
-              children: [...currentLine],
-              spacing: { after: 120 },
-            }));
-          }
-          currentLine = [run];
+          if (currentLine.length > 0) lines.push(currentLine);
+          currentLine = [item];
           lastY = item.transform[5];
         } else {
-          // Check for significant horizontal gap to add spaces
-          if (currentLine.length > 0) {
-            currentLine.push(new TextRun(" "));
-          }
-          currentLine.push(run);
+          currentLine.push(item);
         }
       }
-      
-      // Flush remaining line
-      if (currentLine.length > 0) {
+      if (currentLine.length > 0) lines.push(currentLine);
+
+      // 2. Identify potential tables (lines with multiple columns sharing X boundaries)
+      const pageChildren: any[] = [];
+      let k = 0;
+      while (k < lines.length) {
+        const line = lines[k];
+        
+        // Table detection heuristic: multiple segments with large gaps
+        const isTableLine = line.length > 1 && line.some((item, idx) => {
+          if (idx === 0) return false;
+          const prev = line[idx-1];
+          return (item.transform[4] - (prev.transform[4] + prev.width)) > 40;
+        });
+
+        if (isTableLine) {
+          // Attempt to consume subsequent lines into the table
+          const tableLines = [line];
+          let next = k + 1;
+          while (next < lines.length) {
+            const nextLine = lines[next];
+            const nextIsTable = nextLine.length > 1 && Math.abs(nextLine.length - line.length) <= 2;
+            if (nextIsTable) {
+              tableLines.push(nextLine);
+              next++;
+            } else break;
+          }
+          
+          if (tableLines.length >= 2) {
+            // Reconstruct as a Word Table
+            const rows = tableLines.map(rowLine => {
+              // Group items into cells based on X clusters
+              const cells = rowLine.map(item => new TableCell({
+                children: [new Paragraph({
+                  children: [new TextRun({
+                    text: item.str,
+                    size: Math.round(item.transform[3]) * 2,
+                  })]
+                })],
+                width: { size: 100 / rowLine.length, type: WidthType.PERCENTAGE },
+              }));
+              return new TableRow({ children: cells });
+            });
+            
+            pageChildren.push(new Table({
+              rows,
+              width: { size: 100, type: WidthType.PERCENTAGE },
+              borders: {
+                top: { style: BorderStyle.SINGLE, size: 1 },
+                bottom: { style: BorderStyle.SINGLE, size: 1 },
+                left: { style: BorderStyle.SINGLE, size: 1 },
+                right: { style: BorderStyle.SINGLE, size: 1 },
+              }
+            }));
+            pageChildren.push(new Paragraph({ children: [] })); // Spacer
+            k = next;
+            continue;
+          }
+        }
+
+        // Standard Paragraph rendering for non-table lines
+        const runItems = line.map((item, idx) => {
+          const runs = [];
+          if (idx > 0) {
+            const gap = item.transform[4] - (line[idx-1].transform[4] + line[idx-1].width);
+            if (gap > 5) runs.push(new TextRun({ text: " ", size: Math.round(item.transform[3]) * 2 }));
+          }
+          runs.push(new TextRun({
+            text: item.str,
+            size: Math.round(item.transform[3]) * 2,
+            bold: /bold|heavy/i.test(item.fontName || ''),
+            italics: /italic|oblique/i.test(item.fontName || ''),
+            font: "Arial",
+          }));
+          return runs;
+        }).flat();
+
+        const xStart = line[0].transform[4];
+        let alignment: any = AlignmentType.LEFT;
+        if (xStart > viewport.width * 0.3 && xStart < viewport.width * 0.5 && line.length < 5) {
+          alignment = AlignmentType.CENTER;
+        }
+
+        const firstFontSize = Math.round(line[0].transform[3]);
+        let heading: any = undefined;
+        if (firstFontSize > 18) heading = HeadingLevel.HEADING_1;
+        else if (firstFontSize > 14) heading = HeadingLevel.HEADING_2;
+
         pageChildren.push(new Paragraph({
-          children: currentLine,
+          children: runItems,
+          alignment,
+          heading,
+          spacing: { after: 120, before: heading ? 240 : 0 },
         }));
+        
+        k++;
       }
 
-      sections.push({
-        children: pageChildren,
-      });
+      sections.push({ children: pageChildren });
     }
 
-    const doc = new Document({
-      sections,
-    });
-
-    console.log('Generating Word file with structure preservation...');
+    const doc = new Document({ sections });
     return await Packer.toBlob(doc);
   } catch (error) {
-    console.error('Advanced PDF to Word Error:', error);
+    console.error('Professional Converter Error:', error);
     throw error;
   }
 }
 
 export async function convertWordToPdf(file: File): Promise<Blob> {
-  console.log('Starting Word to PDF conversion...');
+  console.log('Starting Vector-Grade Word to PDF conversion...');
   const arrayBuffer = await file.arrayBuffer();
   
   try {
     const { value: html } = await mammoth.convertToHtml({ arrayBuffer });
-    console.log('Word content converted to HTML');
-
+    
     const container = document.createElement('div');
     container.style.position = 'absolute';
     container.style.left = '-9999px';
-    container.style.width = '800px';
-    container.style.padding = '40px';
+    container.style.width = '840px'; // Matching standard A4 width approx
+    container.style.padding = '60px'; // Margins
     container.style.background = 'white';
-    container.className = 'word-content-container';
-    container.innerHTML = html;
+    container.style.lineHeight = '1.6';
+    container.style.fontFamily = 'Arial, sans-serif';
+    container.className = 'docx-content-preview';
+    container.innerHTML = `
+      <style>
+        table { border-collapse: collapse; width: 100%; margin: 1em 0; }
+        th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+        h1 { font-size: 24pt; margin-bottom: 0.5em; }
+        p { margin-bottom: 1em; }
+      </style>
+      ${html}
+    `;
     document.body.appendChild(container);
 
-    console.log('Rendering HTML to Canvas...');
     const canvas = await html2canvas(container, {
-      scale: 2,
+      scale: 3, // High-fidelity scaling for crispness
       useCORS: true,
       logging: false,
+      backgroundColor: '#ffffff'
     });
-    
-    const imgWidth = canvas.width / 2;
-    const imgHeight = canvas.height / 2;
-    
-    // Standard A4 aspect ratio is approx 1.414. For width 800px, height is approx 1131px.
-    const pageWidth = imgWidth;
-    const pageHeight = (pageWidth * 297) / 210; // A4 ratio
-    const totalPages = Math.ceil(imgHeight / pageHeight);
-
-    const pdf = new jsPDF({
-      orientation: 'portrait',
-      unit: 'px',
-      format: [pageWidth, pageHeight],
-    });
-
-    const imgData = canvas.toDataURL('image/png');
-
-    for (let i = 0; i < totalPages; i++) {
-      if (i > 0) pdf.addPage([pageWidth, pageHeight], 'portrait');
-      
-      // Calculate source y (where to clip from the original canvas)
-      // Since we used scale 2, we need to multiply by 2 for the source coordinate
-      const sourceY = i * pageHeight * 2;
-      const sourceHeight = Math.min(pageHeight * 2, (canvas.height - sourceY));
-      
-      // We can use the full image and just shift the Y offset in addImage
-      // but jspdf's addImage with cropping is sometimes finicky.
-      // A more robust way is to draw a slice to a new canvas or just use the whole image with negative Y
-      pdf.addImage(
-        imgData, 
-        'PNG', 
-        0, 
-        - (i * pageHeight), 
-        imgWidth, 
-        imgHeight
-      );
-    }
     
     document.body.removeChild(container);
-    console.log(`Generated PDF with ${totalPages} pages.`);
+
+    // Logic for paginated PDF
+    const imgWidth = canvas.width;
+    const imgHeight = canvas.height;
+    
+    const pageWidth = 595.28; // A4 point width
+    const pageHeight = 841.89; // A4 point height
+    const canvasPageHeight = (imgWidth * pageHeight) / pageWidth;
+    
+    const totalPages = Math.ceil(imgHeight / canvasPageHeight);
+    const pdf = new jsPDF('p', 'pt', 'a4');
+
+    for (let j = 0; j < totalPages; j++) {
+      if (j > 0) pdf.addPage();
+      
+      const sourceY = j * canvasPageHeight;
+      const sourceHeight = Math.min(canvasPageHeight, imgHeight - sourceY);
+      
+      const tempCanvas = document.createElement('canvas');
+      tempCanvas.width = imgWidth;
+      tempCanvas.height = sourceHeight;
+      const ctx = tempCanvas.getContext('2d');
+      if (ctx) {
+        ctx.drawImage(canvas, 0, sourceY, imgWidth, sourceHeight, 0, 0, imgWidth, sourceHeight);
+        const pageData = tempCanvas.toDataURL('image/jpeg', 0.95);
+        pdf.addImage(pageData, 'JPEG', 0, 0, pageWidth, (sourceHeight * pageWidth) / imgWidth);
+      }
+    }
+    
     return pdf.output('blob');
   } catch (error) {
     console.error('Word to PDF Error:', error);
